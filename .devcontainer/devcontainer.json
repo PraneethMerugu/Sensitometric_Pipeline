@@ -1,0 +1,29 @@
+{
+  "name": "JAX ROCm (Strix Halo)",
+  "build": { "dockerfile": "Dockerfile" },
+  "runArgs": [
+    "--device=/dev/kfd",
+    "--device=/dev/dri",
+    "--security-opt", "seccomp=unconfined",
+    "--group-add", "video",
+    "--shm-size", "16gb"
+  ],
+  
+  // 1. Install requirements (now includes petsc4py building)
+  // 2. Install jax-fem without breaking GPU JAX
+  "postCreateCommand": "pip install -r requirements.txt ",
+
+  "remoteUser": "root",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "Anthropic.claude-code",
+        "ms-azuretools.vscode-containers",
+        "ms-python.vscode-pylance",
+        "ms-python.python",
+        "ms-python.debugpy",
+        "ms-python.vscode-python-envs"
+      ]
+    }
+  }
+}

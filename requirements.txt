@@ -1,0 +1,71 @@
+# ============================================================================
+# JAX Ecosystem - Core Dependencies
+# ============================================================================
+# NOTE: jaxlib 0.7.1 has known bugs. JAX 0.7.0 and 0.7.1 should be avoided.
+# The Equinox project explicitly warns against JAX 0.7.0/0.7.1
+# See: https://github.com/patrick-kidger/equinox/issues/1088
+#
+# RECOMMENDED: Upgrade to jax==0.7.2 jaxlib==0.7.2 if possible
+# If you must use jaxlib 0.7.1, be aware of potential bugs
+jax==0.7.1
+jaxlib==0.7.1
+
+# ============================================================================
+# Scientific Computing Libraries
+# ============================================================================
+# Equinox: Neural networks and scientific computing with JAX
+# Requires: jax>=0.4.14, Python 3.9+
+# WARNING: May have compatibility issues with JAX 0.7.1 (see note above)
+equinox>=0.11.0
+
+# Optimistix: Nonlinear optimization library
+# Requires: jax>=0.4.14, equinox>=0.11.0
+# Note: Depends on lineax and jaxtyping
+optimistix>=0.0.5
+
+# Lineax: Linear solvers for JAX (dependency of optimistix)
+lineax>=0.0.5
+
+# Diffrax: Numerical differential equation solvers
+diffrax>=0.4.1
+
+# Flax: Neural network library (used for GrainNet)
+flax>=0.7.0
+
+# ============================================================================
+# Array and Numerical Libraries
+# ============================================================================
+# NumPy: Fundamental package for numerical computing
+numpy>=1.26.0,<2.0.0
+
+# JAX typing: Type annotations for JAX arrays
+jaxtyping>=0.2.23
+
+# ml_dtypes: Machine learning data types (JAX dependency)
+ml_dtypes>=0.2.0
+
+# ============================================================================
+# Data Processing
+# ============================================================================
+# Pandas: Data manipulation and CSV processing
+pandas>=2.0.0
+
+# ============================================================================
+# Utilities
+# ============================================================================
+# typing-extensions: Backported and experimental type hints
+typing-extensions>=4.5.0
+
+# ============================================================================
+# NOTES
+# ============================================================================
+# Do NOT put jax-fem here
+#
+# Version Compatibility Matrix:
+# - JAX 0.7.1 + jaxlib 0.7.1: Has known bugs, use with caution
+# - Equinox: Tested with JAX 0.4.14+, may have issues with JAX 0.7.1
+# - Optimistix: Requires JAX 0.4.14+, Equinox 0.11.0+
+#
+# If you encounter issues, consider upgrading to:
+#   jax==0.7.2
+#   jaxlib==0.7.2
