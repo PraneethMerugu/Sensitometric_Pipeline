@@ -17,11 +17,11 @@ import jax.numpy as jnp
 import equinox as eqx
 from typing import Dict, Any
 
-from core.optical.scattering import OpticalPhysics
-from core.chemical.reaction_diffusion import ChemicalDiffusion
-from core.sensitometry.tone_curve import SensitometricCurve
-from core.color.dye_densities import ColorimetricTransform
-from core.grainnet.model import GrainNet
+from core.optical import OpticalPhysics
+from core.chemical import ChemicalDiffusion
+from core.sensitometry import SensitometricCurve
+from core.color import ColorimetricTransform
+from core.grainnet import GrainNet
 
 class FilmPipeline(eqx.Module):
     optical: OpticalPhysics
@@ -48,12 +48,19 @@ class FilmPipeline(eqx.Module):
         # We assume curve_params is passed in params
         curve = SensitometricCurve(params=params['curve_params'])
         
+        # Resolve Matrix
+        c_mat = params.get('coupling_matrix', None)
+        if c_mat is None:
+            # Fallback to legacy gamma
+            g = params.get('gamma', 2.0)
+            c_mat = jnp.eye(3) * g
+            
         self.chemistry = ChemicalDiffusion(
             tone_curve=curve,
             diff_coeff=params.get('diff_coeff', 1.0),
             k_ads=params.get('k_ads', 0.5),
             k_des=params.get('k_des', 0.1),
-            gamma=params.get('gamma', 2.0)
+            coupling_matrix=c_mat
         )
         
         # 3. Color

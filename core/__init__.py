@@ -1,0 +1,3 @@
+"""
+Core Film Emulation Modules
+"""

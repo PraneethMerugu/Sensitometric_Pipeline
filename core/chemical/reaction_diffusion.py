@@ -41,18 +41,25 @@ class ChemicalDiffusion(eqx.Module):
     diff_coeff: jax.Array  # D_p (Diffusion rate of inhibitors)
     k_ads: jax.Array       # Adsorption rate (Free -> Bound)
     k_des: jax.Array       # Desorption rate (Bound -> Free)
-    gamma: jax.Array       # Inhibition strength (Impact of P* on development rate)
+    coupling_matrix: jax.Array # Matrix (3,3) for cross-channel inhibition
     
     # Dependencies
     tone_curve: eqx.Module # SensitometricCurve instance
     laplacian_kernel: jax.Array
 
-    def __init__(self, tone_curve, diff_coeff=1.0, k_ads=0.5, k_des=0.1, gamma=2.0):
+    def __init__(self, tone_curve, diff_coeff=1.0, k_ads=0.5, k_des=0.1, coupling_matrix=None):
         self.tone_curve = tone_curve
         self.diff_coeff = jnp.array(diff_coeff)
         self.k_ads = jnp.array(k_ads)
         self.k_des = jnp.array(k_des)
-        self.gamma = jnp.array(gamma)
+        
+        # Handle Coupling Matrix
+        # shape: (3, 3). Row i = channel i. Cols = contribution from other channels.
+        if coupling_matrix is None:
+            # Default to isolated channels (Identity * 2.0 legacy strength)
+            self.coupling_matrix = jnp.eye(3) * 2.0
+        else:
+            self.coupling_matrix = jnp.array(coupling_matrix)
         
         # Standard 3x3 Discrete Laplacian
         kernel = jnp.array([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]])
@@ -78,7 +85,12 @@ class ChemicalDiffusion(eqx.Module):
 
         # 2. COMPUTE INHIBITION (Langmuir Isotherm)
         # Retardation factor F varies from 1.0 (No inhibition) to ~0.0 (Full inhibition)
-        F = 1.0 / (1.0 + self.gamma * P_star)
+        # Matrix Coupling: mixing limits from other channels
+        # P_star is (H, W, 3). Project to "Effective Inhibitors" per channel.
+        # We want to effect on Channel i = sum(Matrix[i, j] * P_star[j])
+        # This corresponds to dot(P_star, Matrix.T)
+        effective_inhibitor = jnp.dot(P_star, self.coupling_matrix.T)
+        F = 1.0 / (1.0 + effective_inhibitor)
 
         # 3. REACTION RATE
         rate = potential * F
@@ -176,7 +188,7 @@ if __name__ == "__main__":
     
     # 2. Initialize Solver
     # Use strong gamma and diffusion to make effects visible on small grid
-    chem = ChemicalDiffusion(tone_curve=curve, diff_coeff=2.0, gamma=5.0)
+    chem = ChemicalDiffusion(tone_curve=curve, diff_coeff=2.0, coupling_matrix=jnp.eye(3)*5.0)
     
     # 3. Create Step Edge Pair
     # Left: Dark (Low Exposure), Right: Bright (High Exposure)
