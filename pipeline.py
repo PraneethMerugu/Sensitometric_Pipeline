@@ -22,9 +22,12 @@ from core.chemical import ChemicalDiffusion
 from core.sensitometry import SensitometricCurve
 from core.color import ColorimetricTransform
 from core.grainnet import GrainNet
+from core.grainnet import GrainNet
+from core.upsampler.spectral_upsampler import create_upsampler, SpectralUpsampler
 
 class FilmPipeline(eqx.Module):
     optical: OpticalPhysics
+    upsampler: SpectralUpsampler
     chemistry: ChemicalDiffusion
     color_transform: ColorimetricTransform
     grain_net: GrainNet
@@ -35,13 +38,17 @@ class FilmPipeline(eqx.Module):
         grain_model_params: Dict,
         color_transform: ColorimetricTransform
     ):
-        # 1. Optical
+        # 1. Shared Resources
+        self.upsampler = create_upsampler(lut_size=32, data_dir="data/luts")
+
+        # 2. Optical
         self.optical = OpticalPhysics(
+            upsampler=self.upsampler,
             scatter_gamma=params.get('scatter_gamma', 0.65),
-            bloom_sigma=params.get('bloom_sigma', 2.0),
-            bloom_weight=params.get('bloom_weight', 0.15),
+            bloom_mix=params.get('bloom_weight', 0.15),
             halation_radius=params.get('halation_radius', 30.0),
-            halation_sigma=params.get('halation_sigma', 8.0)
+            halation_sigma=params.get('halation_sigma', 8.0),
+            halation_gain=params.get('halation_gain', 1.5)
         )
         
         # 2. Physics / Sensitometry
