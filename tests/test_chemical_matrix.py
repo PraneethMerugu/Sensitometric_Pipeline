@@ -96,8 +96,51 @@ class TestChemicalMatrix(unittest.TestCase):
         print(f"Green Density (Green Only): {dens_A:.4f}")
         print(f"Green Density (Green + Red): {dens_B:.4f}")
         
-        # Expect B to be lower (inhibited)
-        self.assertLess(dens_B, dens_A)
+        # Old Expectation: B < A (Inhibition)
+        # New Expectation (High-Pass Coupling):
+        # In flat areas, D_micro == D_macro because high_pass_detail == 0.
+        # So Global Colorimetry is PRESERVED.
+        
+        # 1. Verify Flat Field Preservation
+        # NOTE: Step 6 (Exhaustion) applies a global tone curve: 
+        # D_out = d_max * tanh(D_in / d_max)
+        # We must account for this compression. The Matrix itself should contribute 0.
+        
+        d_max = chem.d_max
+        expected_val = d_max * jnp.tanh(0.5 / d_max) # ~0.4954 for d_max=3.0
+        
+        diff_A = jnp.abs(dens_A - expected_val)
+        diff_B = jnp.abs(dens_B - expected_val)
+        
+        self.assertLess(diff_A, 1e-3, f"Density changed beyond exhaustion curve! Got {dens_A:.4f}, expected {expected_val:.4f}")
+        self.assertLess(diff_B, 1e-3, f"Density changed beyond exhaustion curve! Got {dens_B:.4f}, expected {expected_val:.4f}")
+        print(f">> PASS: Global Colorimetry Preserved (Matches exhaustion curve: {expected_val:.4f}).")
+        
+        # 2. Verify Cross-Talk on Edges (Sharpening)
+        # We need an EDGE to see the effect.
+        # Create a Red Edge, measure effect on Green.
+        
+        # Red: Low (0.0) -> High (1.0) at x=16
+        D_edge = jnp.zeros((H,W,3))
+        D_edge = D_edge.at[:, :, 1].set(0.5) # Flat Green
+        D_edge = D_edge.at[:, 16:, 0].set(1.0) # Red Step
+        
+        res_edge = chem(D_edge)
+        
+        # At the edge (x=16):
+        # Red Density: 0.0 -> 1.0
+        # High Pass (Red): Postive Spike (Edge)
+        # Matrix: Green += 5.0 * Red_Detail
+        # Expect Green to SPIKE at the edge
+        
+        g_flat = res_edge[5, 5, 1]  # 0.5
+        g_edge = res_edge[16, 16, 1] # Should be > 0.5
+        
+        print(f"Green Flat: {g_flat:.4f}")
+        print(f"Green at Red Edge: {g_edge:.4f}")
+        
+        self.assertGreater(g_edge, g_flat + 0.01, "Cross-talk sharpening failed!")
+
         print(">> PASS: Cross-channel inhibition verified.")
 
 if __name__ == "__main__":

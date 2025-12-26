@@ -132,12 +132,19 @@ class ChemicalDevelopment(eqx.Module):
         # 3. Basis Interpolation
         inhibitor_field_linear = (cloud_hard * tanning_mask) + (cloud_soft * (1.0 - tanning_mask))
         
-        # 4. Apply Chemical Coupling Matrix
-        # We act on the linear field directly now
-        inhibition_term = jnp.einsum('ij, hwi -> hwj', self.coupling_matrix, inhibitor_field_linear)
+        # 4. Calculate High-Pass (Detail) Signal
+        # This represents the spatial "edge" energy relative to the diffusion cloud.
+        # In flat areas, (D_macro - inhibitor_field) ~ 0, preserving global colorimetry.
+        high_pass_detail = D_macro - inhibitor_field_linear
+
+        # 5. Apply Chemical Coupling to Detail Signal (High-Pass Coupling)
+        # Transform the detail vectors using the matrix (allowing cross-talk).
+        # We ADD this back to the macro density (Unsharp Masking technique).
+        # Einsum: (3,3) @ (H,W,3) -> (H,W,3)
+        cross_channel_detail = jnp.einsum('ij, hwi -> hwj', self.coupling_matrix, high_pass_detail)
         
-        # 5. Calculate "Ideal" Micro Density (Pure Inhibition)
-        D_micro_ideal = D_macro - inhibition_term
+        # Recombine: Base Density + Chemically Enhanced Edges
+        D_micro_ideal = D_macro + cross_channel_detail
         
         # 6. Apply Exhaustion as a Density Cap (Supply Limiter)
         # Limit the maximum density based on available chemistry
