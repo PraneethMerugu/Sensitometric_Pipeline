@@ -18,7 +18,7 @@ import equinox as eqx
 from typing import Dict, Any
 
 from core.optical import OpticalPhysics
-from core.chemical import ChemicalDiffusion
+from core.chemical import ChemicalDevelopment
 from core.sensitometry import SensitometricCurve
 from core.color import ColorimetricTransform
 from core.grainnet import GrainNet
@@ -28,7 +28,8 @@ from core.upsampler.spectral_upsampler import create_upsampler, SpectralUpsample
 class FilmPipeline(eqx.Module):
     optical: OpticalPhysics
     upsampler: SpectralUpsampler
-    chemistry: ChemicalDiffusion
+    chemistry: ChemicalDevelopment
+    tone_curve: SensitometricCurve
     color_transform: ColorimetricTransform
     grain_net: GrainNet
     
@@ -53,21 +54,23 @@ class FilmPipeline(eqx.Module):
         
         # 2. Physics / Sensitometry
         # We assume curve_params is passed in params
-        curve = SensitometricCurve(params=params['curve_params'])
+        self.tone_curve = SensitometricCurve(params=params['curve_params'])
         
         # Resolve Matrix
         c_mat = params.get('coupling_matrix', None)
         if c_mat is None:
-            # Fallback to legacy gamma
+            # Fallback to legacy gamma (Self-Inhibition Only)
+            # FIX: "Double-Counting Crosstalk"
+            # We use a Diagonal Matrix to prevent adding color crosstalk (already in curves).
             g = params.get('gamma', 2.0)
             c_mat = jnp.eye(3) * g
             
-        self.chemistry = ChemicalDiffusion(
-            tone_curve=curve,
-            diff_coeff=params.get('diff_coeff', 1.0),
-            k_ads=params.get('k_ads', 0.5),
-            k_des=params.get('k_des', 0.1),
-            coupling_matrix=c_mat
+        self.chemistry = ChemicalDevelopment(
+            sigma_soft=params.get('sigma_soft', 2.0),
+            sigma_hard=params.get('sigma_hard', 0.5),
+            coupling_matrix=c_mat,
+            d_min=params.get('d_min', 0.0),
+            d_max=params.get('d_max', 3.0)
         )
         
         # 3. Color
@@ -94,11 +97,14 @@ class FilmPipeline(eqx.Module):
         
         # 2. CHEMICAL DEVELOPMENT (Non-Linear)
         # Simulates the development tank. 
-        # Applies Tone Mapping AND Edge Effects (Friedman-Ross).
+        # Applies Tone Mapping AND Edge Effects (Matrix Model).
         # Output: Analytical Dye Densities (C, M, Y) 
-        # Note: The solver computes Developed Silver, which we map 1:1 to Dye amount here.
-        # (params shape (3,5) implies 3 channels handled independently)
-        developed_density = self.chemistry.simulate(latent_image, t_end=5.0)
+        
+        # First: Apply Macro Tone Mapping
+        d_macro = self.tone_curve(latent_image)
+        
+        # Second: Apply Micro-Contrast (Adjacency)
+        developed_density = self.chemistry(d_macro)
         
         # 3. COLORIMETRY
         # Convert dye densities (CMY) to Visual Integral Densities (RGB)

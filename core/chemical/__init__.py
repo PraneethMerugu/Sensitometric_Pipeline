@@ -1,3 +1,3 @@
-from .reaction_diffusion import ChemicalDiffusion, ReactionState
+from .matrix import ChemicalDevelopment
 
-__all__ = ["ChemicalDiffusion", "ReactionState"]
+__all__ = ["ChemicalDevelopment"]
