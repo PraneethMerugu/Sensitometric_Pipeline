@@ -261,14 +261,22 @@ $$
 
 This prevents unnatural "black halos" around extremly bright sources by soft-clipping the inhibition strength.
 
-#### 4. Chemical Coupling Matrix (Diagonal)
-To avoid **Double-Counting Crosstalk**, the default coupling matrix is **Diagonal**:
+#### 4. High-Pass (AC) Chemical Coupling
+To allow for strong **inter-image effects** (e.g., Red sharpening Green) without distorting the carefully calibrated global colorimetry, we use a **High-Pass Coupling** approach.
+
+We calculate the **Detail Signal** (AC component) by subtracting the blurred inhibitor field from the sharp macro density:
 
 $$
-\mathbf{K} = \begin{bmatrix} k_{rr} & 0 & 0 \\ 0 & k_{gg} & 0 \\ 0 & 0 & k_{bb} \end{bmatrix}
+\Delta_{\text{detail}} = D_{\text{macro}} - I_{\text{linear}}
 $$
 
-Since the input Sensitometric Curves (D-logE) already capture the global dye crosstalk and inter-layer separation of the calibrated stock, we use this matrix *only* for spatial adjacency effects (Sharpening/Bloom), not for color correction.
+In flat areas, $\Delta_{\text{detail}} \approx 0$, preserving the base density. At edges, this signal captures the "chiseling" energy. We then apply the **Coupling Matrix** $\mathbf{K}$ to this detail signal only and **add** it back to the base density:
+
+$$
+D_{\text{micro}} = D_{\text{macro}} + (\mathbf{K} \cdot \Delta_{\text{detail}})
+$$
+
+This elegantly solves the **Double-Counting Fallacy**. Since the input Sensitometric Curves (D-logE) already capture the global dye crosstalk of the film, we must strictly ensure our spatial matrix adds **zero net density** to flat fields. This High-Pass formulation guarantees that locally, while allowing us to pump up edge contrast (acutance) arbitrarily high.
 
 ---
 
