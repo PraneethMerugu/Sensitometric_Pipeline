@@ -66,51 +66,62 @@ class ChemicalDevelopment(eqx.Module):
         return self.apply(D_macro)
 
     def apply(self, D_macro: jax.Array) -> jax.Array:
-        # 1. Generate Basis Clouds (Convolution)
+        # 1. Generate Basis Clouds
         
-        # Helper for Anisotropic Gaussian Blur
+        # Helper for Anisotropic Gaussian Blur (Keep for Hard Cloud)
         def gaussian_blur(img, sigma_base, drag_ratio, max_window_size):
-             # sigma_x = sigma_base
-             # sigma_y = sigma_base * drag_ratio
              sx = sigma_base
              sy = sigma_base * drag_ratio
              
              h, w = img.shape
-             
-             # Calculate Window Size (based on the larger sigma)
              limit = jnp.minimum(h, w)
              window_size = jnp.minimum(max_window_size, limit)
              window_size = window_size - (1 - window_size % 2) # Ensure odd
              radius = window_size // 2
-             
              x = jnp.arange(-radius, radius + 1)
-             
-             # Kernel X
              kx = jnp.exp(-0.5 * (x / sx)**2)
              kx = kx / jnp.sum(kx)
-             
-             # Kernel Y
              ky = jnp.exp(-0.5 * (x / sy)**2)
              ky = ky / jnp.sum(ky)
-             
-             # Separable convolution
-             # 1. Vertical (Col) using ky
              k_col = ky.reshape(-1, 1)
              vert = jax.scipy.signal.correlate(img, k_col, mode='same')
-             
-             # 2. Horizontal (Row) using kx
              k_row = kx.reshape(1, -1)
              return jax.scipy.signal.correlate(vert, k_row, mode='same')
 
-        # Vectorize over channels
+        # Helper for Directional Drag (Bromide Drag)
+        def apply_directional_drag(img: jax.Array, decay: float) -> jax.Array:
+            """
+            Simulates vertical bromide drag using a causal recursive filter.
+            y[i] = x[i] + decay * y[i-1]
+            Args:
+                img: (H, W) Density map
+                decay: 0.0 to 1.0 (How far the streak goes)
+            """
+            def scan_body(carry, x):
+                new_val = x + decay * carry
+                return new_val, new_val
+
+            # Scan top-to-bottom (Gravity direction)
+            _, dragged = jax.lax.scan(scan_body, jnp.zeros(img.shape[1]), img)
+            # Normalize to prevent energy explosion
+            return dragged * (1.0 - decay)
+
+        # Vectorize helpers over channels
         blur = jax.vmap(gaussian_blur, in_axes=(2, None, None, None), out_axes=2)
+        drag = jax.vmap(apply_directional_drag, in_axes=(2, None), out_axes=2)
         
-        # --- Soft Cloud ---
-        # Fixed window size for "Soft" effect? 
-        w_soft = 61 # Increased window for drag
-        cloud_soft = blur(D_macro, self.sigma_soft, self.drag_ratio, w_soft)
+        # --- Soft Cloud (Bromide Drag) ---
+        # Map sigma_soft to decay rate for the recursive filter
+        # Heuristic: Decay constant related to sigma. 
+        # For a recursive filter e^(-x/sigma), decay factor alpha = e^(-1/sigma)
+        drag_decay = jnp.exp(-1.0 / self.sigma_soft)
+        # Ensure decay is valid (0 to 1) and stable
+        drag_decay = jnp.clip(drag_decay, 0.0, 0.999) 
         
-        # --- Hard Cloud ---
+        # Apply directional drag instead of Gaussian blur for the soft component
+        cloud_soft = drag(D_macro, drag_decay)
+        
+        # --- Hard Cloud (Local Softness/Tanning) ---
         w_hard = 25
         cloud_hard = blur(D_macro, self.sigma_hard, self.drag_ratio, w_hard)
         
@@ -121,16 +132,18 @@ class ChemicalDevelopment(eqx.Module):
         # 3. Basis Interpolation
         inhibitor_field_linear = (cloud_hard * tanning_mask) + (cloud_soft * (1.0 - tanning_mask))
         
-        # 4. Sigmoidal Exhaustion (Non-Linearity)
-        # I_nonlinear = 1.0 / (1.0 + exp(-alpha * (I - beta)))
-        # Applying exhaustion curve to the linear inhibitor field
-        inhibitor_field = 1.0 / (1.0 + jnp.exp(-self.exhaustion_alpha * (inhibitor_field_linear - self.exhaustion_beta)))
+        # 4. Apply Chemical Coupling Matrix
+        # We act on the linear field directly now
+        inhibition_term = jnp.einsum('ij, hwi -> hwj', self.coupling_matrix, inhibitor_field_linear)
         
-        # 5. Apply Chemical Coupling Matrix
-        inhibition_term = jnp.einsum('ij, hwi -> hwj', self.coupling_matrix, inhibitor_field)
+        # 5. Calculate "Ideal" Micro Density (Pure Inhibition)
+        D_micro_ideal = D_macro - inhibition_term
         
-        # 6. Final Subtraction
-        D_micro = D_macro - inhibition_term
+        # 6. Apply Exhaustion as a Density Cap (Supply Limiter)
+        # Limit the maximum density based on available chemistry
+        # We use d_max as the supply limit
+        supply_limit = self.d_max
+        D_micro = supply_limit * jnp.tanh(D_micro_ideal / (supply_limit + 1e-6))
         
         return D_micro
 

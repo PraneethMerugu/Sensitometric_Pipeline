@@ -107,12 +107,34 @@ class OpticalPhysics(eqx.Module):
         psf = 1.0 / (1.0 + (r / g)**2)**1.5
         return psf / jnp.sum(psf)
 
-    def _diffused_annulus(self, r, radius, sigma):
-        """Gaussian Ring for Backward Scattering (Halation)."""
-        s = jnp.maximum(sigma, 1e-4)
-        # Gaussian offset by radius = Diffused Ring
-        psf = jnp.exp(-((r - radius)**2) / (2 * s**2))
-        return psf / jnp.sum(psf)
+    def _physical_halation_kernel(self, r_grid):
+        """
+        Physically derived Halation Kernel (Fresnel Reflection).
+        Based on reflection off the base-air/remjet interface.
+        """
+        # r_grid is distance in pixels.
+        # r_norm = r_grid / self.halation_radius # Radius normalized to critical ring
+        
+        # Avoid division by zero
+        r_radius = jnp.maximum(self.halation_radius, 1e-4)
+        r_norm = r_grid / r_radius
+        
+        # Empirical fit to Fresnel reflection curve:
+        # Sharp peak at r_norm = 1.0 (Critical Angle), rapid falloff after.
+        intensity = jnp.exp(4.0 * (r_norm - 1.0)) * (r_norm <= 1.0)
+        
+        # Add diffusion (scattering by the rem-jet backing)
+        # Convolve this sharp ring with a small Gaussian (Approximated)
+        # We use halation_sigma to control the width of this peak effectively? 
+        # The snippet had fixed 0.2. Let's make it relative?
+        # User snippet: kernel = intensity * jnp.exp(-0.5 * ((r_norm - 1.0)/0.2)**2)
+        # I will stick to the snippet's constants as requested, 
+        # but maybe scaling 0.2 by some factor if needed? 
+        # Snippet hardcoded 0.2. I'll use it.
+        
+        kernel = intensity * jnp.exp(-0.5 * ((r_norm - 1.0)/0.2)**2)
+        
+        return kernel / (jnp.sum(kernel) + 1e-8)
 
     def integrate_exposure(self, spectral_cube: jax.Array) -> Tuple[jax.Array, jax.Array, jax.Array]:
         """
@@ -133,7 +155,8 @@ class OpticalPhysics(eqx.Module):
 
         # 1. Compute Kernels (OTFs)
         psf_bloom = self._lorentzian(r_grid, self.scatter_gamma)
-        psf_hal = self._diffused_annulus(r_grid, self.halation_radius, self.halation_sigma)
+        # psf_hal = self._diffused_annulus(r_grid, self.halation_radius, self.halation_sigma)
+        psf_hal = self._physical_halation_kernel(r_grid)
 
         otf_bloom = fft.fft2(psf_bloom)
         otf_hal = fft.fft2(psf_hal)
@@ -153,95 +176,58 @@ class OpticalPhysics(eqx.Module):
         b_bloomed = jnp.abs(fft.ifft2(b_bloomed_fft))
         
         # --- ABSORPTION: Yellow Filter ---
-        # The bloomed blue light passes through the yellow filter.
-        # We need a scalar attenuation factor for the *already integrated* blue light.
-        # Approximation: We assume the Blue SSF is fully "behind" the filter relative to the base?
-        # No, physically: Blue Layer -> Filter -> Green -> Red -> Base.
-        # So "Blue Bloomed" is what forms the Blue Image.
-        # But "Blue Light" that continues down is filtered.
-        # We calculate "Filtered Blue" by attenuating the Blue Exposure.
-        # Since we don't have the full spectrum at this point (we collapsed it), 
-        # we need an effective transmission coefficient.
-        # T_eff = dot(Blue_SSF * Yellow_T, Spectrum) / dot(Blue_SSF, Spectrum) ?
-        # Simpler: Just integrate the Yellow T against the Blue Sensitivity to get a scalar loss.
-        # scalar_T = dot(SSF_Blue * T_Yellow) / sum(SSF_Blue)
-        # This represents "How much of the light that excites Blue also passes through Yellow?"
-        
+        # Calculate transmission factor for the broadband Blue channel
         blue_pass_factor = jnp.dot(self.ssf_blue * self.transmission_yellow, jnp.ones(64)) / jnp.sum(self.ssf_blue)
-        # Ideally we'd filter the spectrum itself, but for performance we operate on the exposure map.
-        # We assume the spectrum of the light matches the SSF (simplification).
         
-        blue_continuing = b_bloomed * blue_pass_factor
-
-        # --- PASS 2: Bottom Layers (Green + Red + Filtered Blue) ---
-        # Light reaching here includes the scene's Green/Red light + the filtered Blue scatter.
-        # We combine them into a "Deep Scatter Source".
-        deep_source = g_exp + r_exp + blue_continuing
+        # --- PASS 2: Deep Layers (Green + Red + Filtered Blue) ---
+        # The filter absorbs Blue light *before* it reaches the scattering volume of G/R.
+        # Deep Source = G_exp + R_exp + (B_exp * transmission)
+        # We use the unbloomed b_exp because the filter is sharp and geometry implies 
+        # the blue halo also passes through or is formed by the deep scattering?
+        # User fix: "Add the unbloomed b_exp to the deep source and then blooming it"
+        
+        blue_filtered = b_exp * blue_pass_factor
+        deep_source = g_exp + r_exp + blue_filtered
         
         deep_fft = fft.fft2(deep_source)
         # Apply Bloom to this combined deep light (Simulating scattering in the emulsion bulk)
         deep_bloomed_fft = deep_fft * ((1.0 - self.bloom_mix) + self.bloom_mix * otf_bloom)
-        deep_bloomed = jnp.abs(fft.ifft2(deep_bloomed_fft))
         
         # --- PASS 3: Halation (Reflection) ---
-        # Halation happens when light hits the base (bottom of the stack).
-        # The light at the bottom is the "Deep Bloomed" light.
-        # We verify: Does Green/Red bloom before hitting the base? Yes.
-        # Ideally, we'd add Halation, then Bloom? No, light scatters -> hits base -> reflects -> scatters back.
-        # Conventional approximation: Halation is a diffuse convolution of the light hitting the base.
-        
-        # We take the Deep Bloomed light as the source for Halation
-        # Convolve with Halation Kernel (The Ring)
+        # Halation is driven by the light reaching the base (Deep Bloomed)
+        # Convolve with PHYSICAL Halation Kernel
         halation_fft = deep_bloomed_fft * otf_hal * self.halation_gain
         halation_signal = jnp.abs(fft.ifft2(halation_fft))
         
         # 4. Re-Assemble Latent Image (RGB)
-        # The "Latent Image" is what the developer sees.
-        # Blue Channel = The Top Layer Bloom
-        # Green Channel = Green Exposure + (Optional Halation Crosstalk)
-        # Red Channel = Red Exposure + Halation (Strongest here)
+        # We need individual channels. 
+        # Standard Channel Blooms:
+        # B_final = B_bloomed
+        # G_final = Bloom(G) + Halation crosstalk
+        # R_final = Bloom(R) + Halation crosstalk
         
-        # Note: We need to output the *Exposure* that drives the density.
-        # We also need to add the "Bloom" effect to Green/Red exposure maps themselves.
-        # Wait, pure G/R exposure maps haven't been bloomed yet in isolation?
-        # In the "Deep" pass we bloomed the sum. 
-        # Let's approximate: 
-        #   Blue_Final = b_bloomed
-        #   Green_Final = Bloom(g_exp) + Small_Halation
-        #   Red_Final   = Bloom(r_exp) + Strong_Halation
+        # Note: We calculated deep_bloomed_fft effectively as Sum(Bloom(G), Bloom(R), Bloom(B_filt)).
+        # But we haven't computed Bloom(G) and Bloom(R) individually for the final image yet.
+        # We'll compute them now.
         
-        # To save FFTs, we can just bloom G and R individually? 
-        # Or just subtract Blue from the Deep Bloom? 
-        # If Bloom is linear: Bloom(G+R+B_filt) = Bloom(G) + Bloom(R) + Bloom(B_filt).
-        # So Bloom(G+R) = Deep_Bloom - Bloom(B_filt).
-        # But we need Bloom(G) and Bloom(R) separate for the channels?
-        # Actually, let's just run 2 more standard blooms or vectorise the FFT.
+        g_fft = fft.fft2(g_exp)
+        r_fft = fft.fft2(r_exp)
         
-        # Vectorized Approach:
-        # Stack [B, G, R] -> FFT -> Apply Bloom -> IFFT.
-        stack_exp = jnp.stack([b_exp, g_exp, r_exp], axis=-1)
-        stack_fft = fft.fft2(stack_exp, axes=(0, 1))
+        g_bloomed_fft = g_fft * ((1.0 - self.bloom_mix) + self.bloom_mix * otf_bloom)
+        r_bloomed_fft = r_fft * ((1.0 - self.bloom_mix) + self.bloom_mix * otf_bloom)
         
-        # Apply Bloom to all channels (Structural Scattering is roughly isotropic)
-        stack_bloomed_fft = stack_fft * ((1.0 - self.bloom_mix) + self.bloom_mix * otf_bloom[..., None])
-        stack_bloomed = jnp.abs(fft.ifft2(stack_bloomed_fft, axes=(0, 1)))
+        g_bloomed = jnp.abs(fft.ifft2(g_bloomed_fft))
+        r_bloomed = jnp.abs(fft.ifft2(r_bloomed_fft))
         
-        # Now add Halation
-        # Halation source was determined by the "Deep Path" logic:
-        # Source = Bloom(G) + Bloom(R) + Bloom(Filter * B)
-        # This is roughly: stack_bloomed[..., 1] + stack_bloomed[..., 2] + blue_pass_factor * stack_bloomed[..., 0]
-        
-        hal_source_approx = stack_bloomed[..., 1] + stack_bloomed[..., 2] + (stack_bloomed[..., 0] * blue_pass_factor)
-        hal_source_fft = fft.fft2(hal_source_approx)
-        
-        # Apply Halation Kernel
-        hal_signal_fft = hal_source_fft * otf_hal * self.halation_gain
-        hal_signal = jnp.abs(fft.ifft2(hal_signal_fft))
-        
-        # Composite Halation into layers
-        # Primarily Red, some Green
+        # Composite Halation
+        # Halation is primarily Red/Orange, but we map it based on halation_vector
+        # Standard Halation Color: Reddish
         hal_vector = jnp.array([0.0, 0.05, 1.0]) # B, G, R weights
         
-        final_latent = stack_bloomed + (hal_signal[..., None] * hal_vector)
+        b_final = b_bloomed + (halation_signal * hal_vector[0])
+        g_final = g_bloomed + (halation_signal * hal_vector[1])
+        r_final = r_bloomed + (halation_signal * hal_vector[2])
+        
+        final_latent = jnp.stack([b_final, g_final, r_final], axis=-1)
 
         return final_latent
