@@ -1,8 +1,14 @@
-
 import jax
 import jax.numpy as jnp
 import unittest
+import sys
+import os
+
+# Add project root to path
+sys.path.append(os.getcwd())
+
 from core.chemical import ChemicalDevelopment
+from core.config import ChemicalConfig
 
 class TestChemicalMatrix(unittest.TestCase):
     def test_shape_consistency(self):
@@ -10,7 +16,10 @@ class TestChemicalMatrix(unittest.TestCase):
         H, W = 64, 64
         D_macro = jnp.ones((H, W, 3)) * 0.5
         
-        chem = ChemicalDevelopment()
+        D_macro = jnp.ones((H, W, 3)) * 0.5
+        
+        config = ChemicalConfig()
+        chem = ChemicalDevelopment(config)
         D_micro = chem(D_macro)
         
         self.assertEqual(D_micro.shape, (H, W, 3))
@@ -26,7 +35,10 @@ class TestChemicalMatrix(unittest.TestCase):
         # Use strong Hard/Soft difference to exaggerate effect
         # Soft=Large Halo, Hard=Tiny Halo. 
         # Tanning should make the boundary sharp.
-        chem = ChemicalDevelopment(sigma_soft=8.0, sigma_hard=1.0, coupling_matrix=jnp.eye(3)*2.0)
+        # Soft=Large Halo, Hard=Tiny Halo. 
+        # Tanning should make the boundary sharp.
+        config = ChemicalConfig(sigma_soft=8.0, sigma_hard=1.0, coupling_matrix=jnp.eye(3)*2.0)
+        chem = ChemicalDevelopment(config)
         
         D_micro = chem(D_macro)
         
@@ -75,7 +87,10 @@ class TestChemicalMatrix(unittest.TestCase):
         K = jnp.zeros((3,3))
         K = K.at[0, 1].set(5.0) # Strong Red -> Green inhibition
         
-        chem = ChemicalDevelopment(coupling_matrix=K)
+        K = K.at[0, 1].set(5.0) # Strong Red -> Green inhibition
+        
+        config = ChemicalConfig(coupling_matrix=K)
+        chem = ChemicalDevelopment(config)
         
         H, W = 32, 32
         
@@ -106,7 +121,10 @@ class TestChemicalMatrix(unittest.TestCase):
         # D_out = d_max * tanh(D_in / d_max)
         # We must account for this compression. The Matrix itself should contribute 0.
         
-        d_max = chem.d_max
+        # D_out = d_max * tanh(D_in / d_max)
+        # We must account for this compression. The Matrix itself should contribute 0.
+        
+        d_max = chem.config.d_max
         expected_val = d_max * jnp.tanh(0.5 / d_max) # ~0.4954 for d_max=3.0
         
         diff_A = jnp.abs(dens_A - expected_val)

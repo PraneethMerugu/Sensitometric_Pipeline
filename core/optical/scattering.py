@@ -12,6 +12,8 @@ import equinox as eqx
 from typing import Tuple, Optional, Dict
 from core.upsampler.spectral_upsampler import SpectralUpsampler
 
+from core.config import OpticalConfig
+
 class OpticalPhysics(eqx.Module):
     """
     Simulates physical light transport in the emulsion using Spectral Radiative Transfer.
@@ -24,13 +26,8 @@ class OpticalPhysics(eqx.Module):
        - Bottom Bloom (Green+Red+FilteredBlue)
        - Halation (Reflection from Bottom)
     """
-    # --- Optical Parameters ---
-    scatter_gamma: jax.Array      # Turbidity width (Lorentzian HWHM)
-    bloom_mix: jax.Array          # Amount of forward scatter (Bloom)
-    
-    halation_radius: jax.Array    # Radius of reflection (Base thickness)
-    halation_sigma: jax.Array     # Diffusion of the reflection (Rem-jet scattering)
-    halation_gain: jax.Array      # Intensity of the halation effect
+    # --- Optical Parameters (Held in Config Module) ---
+    config: OpticalConfig
     
     # --- Physics Data ---
     # Shape (64,): Spectral Sensitivity Functions for Blue, Green, Red layers
@@ -47,20 +44,12 @@ class OpticalPhysics(eqx.Module):
 
     def __init__(
         self,
+        config: OpticalConfig,
         upsampler: SpectralUpsampler,
-        scatter_gamma: float = 0.65,
-        bloom_mix: float = 0.20,
-        halation_radius: float = 30.0,
-        halation_sigma: float = 8.0,
-        halation_gain: float = 1.0,
         sensitivity_data: Optional[Dict[str, jax.Array]] = None
     ):
+        self.config = config
         self.upsampler = upsampler
-        self.scatter_gamma = jnp.array(scatter_gamma)
-        self.bloom_mix = jnp.array(bloom_mix)
-        self.halation_radius = jnp.array(halation_radius)
-        self.halation_sigma = jnp.array(halation_sigma)
-        self.halation_gain = jnp.array(halation_gain)
 
         # PHYSICS KERNEL: Spectral Sensitivity & Filters
         # Default: Load standard Vision3 250D curves if not provided
@@ -82,8 +71,8 @@ class OpticalPhysics(eqx.Module):
 
              # Synthetic Yellow Filter (Sigmoid cutoff at 520nm)
              # Blocks Blue (<520), Passes Green/Red (>520)
-             k = 0.15
-             wl0 = 510.0
+             k = self.config.yellow_filter_slope
+             wl0 = self.config.yellow_filter_cutoff
              self.transmission_yellow = 1.0 / (1.0 + jnp.exp(-k * (wl - wl0)))
              
         else:
@@ -116,23 +105,21 @@ class OpticalPhysics(eqx.Module):
         # r_norm = r_grid / self.halation_radius # Radius normalized to critical ring
         
         # Avoid division by zero
-        r_radius = jnp.maximum(self.halation_radius, 1e-4)
+        r_radius = jnp.maximum(self.config.halation_radius, 1e-4)
         r_norm = r_grid / r_radius
         
         # Empirical fit to Fresnel reflection curve:
         # Sharp peak at r_norm = 1.0 (Critical Angle), rapid falloff after.
-        intensity = jnp.exp(4.0 * (r_norm - 1.0)) * (r_norm <= 1.0)
+        # FIX: Differentiability -> Use Sigmoid instead of Hard Step <= 1.0
+        # This allows gradients to flow when optimizing halation_radius.
+        mask = jax.nn.sigmoid(20.0 * (1.0 - r_norm))
+        intensity = jnp.exp(4.0 * (r_norm - 1.0)) * mask
         
         # Add diffusion (scattering by the rem-jet backing)
         # Convolve this sharp ring with a small Gaussian (Approximated)
-        # We use halation_sigma to control the width of this peak effectively? 
-        # The snippet had fixed 0.2. Let's make it relative?
-        # User snippet: kernel = intensity * jnp.exp(-0.5 * ((r_norm - 1.0)/0.2)**2)
-        # I will stick to the snippet's constants as requested, 
-        # but maybe scaling 0.2 by some factor if needed? 
-        # Snippet hardcoded 0.2. I'll use it.
+        # We use halation_smoothness to control the width of this peak effectively
         
-        kernel = intensity * jnp.exp(-0.5 * ((r_norm - 1.0)/0.2)**2)
+        kernel = intensity * jnp.exp(-0.5 * ((r_norm - 1.0) / self.config.halation_smoothness)**2)
         
         return kernel / (jnp.sum(kernel) + 1e-8)
 
@@ -154,8 +141,7 @@ class OpticalPhysics(eqx.Module):
         r_grid = self._generate_mesh((H, W))
 
         # 1. Compute Kernels (OTFs)
-        psf_bloom = self._lorentzian(r_grid, self.scatter_gamma)
-        # psf_hal = self._diffused_annulus(r_grid, self.halation_radius, self.halation_sigma)
+        psf_bloom = self._lorentzian(r_grid, self.config.scatter_gamma)
         psf_hal = self._physical_halation_kernel(r_grid)
 
         otf_bloom = fft.fft2(psf_bloom)
@@ -172,7 +158,7 @@ class OpticalPhysics(eqx.Module):
         # Blue light scatters immediately (Bloom)
         b_fft = fft.fft2(b_exp)
         # Bloom equation: (1-mix)*img + mix*convolved
-        b_bloomed_fft = b_fft * ((1.0 - self.bloom_mix) + self.bloom_mix * otf_bloom)
+        b_bloomed_fft = b_fft * ((1.0 - self.config.bloom_weight) + self.config.bloom_weight * otf_bloom)
         b_bloomed = jnp.abs(fft.ifft2(b_bloomed_fft))
         
         # --- ABSORPTION: Yellow Filter ---
@@ -191,12 +177,12 @@ class OpticalPhysics(eqx.Module):
         
         deep_fft = fft.fft2(deep_source)
         # Apply Bloom to this combined deep light (Simulating scattering in the emulsion bulk)
-        deep_bloomed_fft = deep_fft * ((1.0 - self.bloom_mix) + self.bloom_mix * otf_bloom)
+        deep_bloomed_fft = deep_fft * ((1.0 - self.config.bloom_weight) + self.config.bloom_weight * otf_bloom)
         
         # --- PASS 3: Halation (Reflection) ---
         # Halation is driven by the light reaching the base (Deep Bloomed)
         # Convolve with PHYSICAL Halation Kernel
-        halation_fft = deep_bloomed_fft * otf_hal * self.halation_gain
+        halation_fft = deep_bloomed_fft * otf_hal * self.config.halation_gain
         halation_signal = jnp.abs(fft.ifft2(halation_fft))
         
         # 4. Re-Assemble Latent Image (RGB)
@@ -213,8 +199,8 @@ class OpticalPhysics(eqx.Module):
         g_fft = fft.fft2(g_exp)
         r_fft = fft.fft2(r_exp)
         
-        g_bloomed_fft = g_fft * ((1.0 - self.bloom_mix) + self.bloom_mix * otf_bloom)
-        r_bloomed_fft = r_fft * ((1.0 - self.bloom_mix) + self.bloom_mix * otf_bloom)
+        g_bloomed_fft = g_fft * ((1.0 - self.config.bloom_weight) + self.config.bloom_weight * otf_bloom)
+        r_bloomed_fft = r_fft * ((1.0 - self.config.bloom_weight) + self.config.bloom_weight * otf_bloom)
         
         g_bloomed = jnp.abs(fft.ifft2(g_bloomed_fft))
         r_bloomed = jnp.abs(fft.ifft2(r_bloomed_fft))

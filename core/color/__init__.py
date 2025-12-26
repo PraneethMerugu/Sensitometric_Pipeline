@@ -1,3 +1,4 @@
-from .dye_densities import ColorimetricTransform
+from .spectral_mixer import SpectralDyeMixer
+from .scanner import VirtualScanner
 
-__all__ = ["ColorimetricTransform"]
+__all__ = ["SpectralDyeMixer", "VirtualScanner"]

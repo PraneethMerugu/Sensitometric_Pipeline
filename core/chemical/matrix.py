@@ -14,6 +14,8 @@ import jax.numpy as jnp
 import equinox as eqx
 from functools import partial
 
+from core.config import ChemicalConfig
+
 class ChemicalDevelopment(eqx.Module):
     """
     Simulates chemical development using a Spatially Variant Matrix Model.
@@ -26,41 +28,13 @@ class ChemicalDevelopment(eqx.Module):
     - Sigmoidal Exhaustion: Non-linear limiter for inhibition.
     - Anisotropic Diffusion: Directional kernels (Bromide Drag).
     """
-    sigma_soft: jax.Array
-    sigma_hard: jax.Array
-    drag_ratio: jax.Array # New: Vertical Stretch Factor (sigma_y / sigma_x)
-    
-    exhaustion_alpha: jax.Array # New: Sigmoid Gain
-    exhaustion_beta: jax.Array  # New: Sigmoid Threshold
-    
-    coupling_matrix: jax.Array
-    d_min: jax.Array
-    d_max: jax.Array
+    config: ChemicalConfig
     
     def __init__(
         self, 
-        sigma_soft: float = 2.0, 
-        sigma_hard: float = 0.5, 
-        drag_ratio: float = 1.0, # 1.0 = Isotropic, >1.0 = Vertical Drag
-        coupling_matrix: jax.Array = None,
-        d_min: float = 0.0,
-        d_max: float = 3.0,
-        exhaustion_alpha: float = 2.0,
-        exhaustion_beta: float = 0.5
+        config: ChemicalConfig
     ):
-        self.sigma_soft = jnp.array(sigma_soft)
-        self.sigma_hard = jnp.array(sigma_hard)
-        self.drag_ratio = jnp.array(drag_ratio)
-        self.d_min = jnp.array(d_min)
-        self.d_max = jnp.array(d_max)
-        self.exhaustion_alpha = jnp.array(exhaustion_alpha)
-        self.exhaustion_beta = jnp.array(exhaustion_beta)
-        
-        if coupling_matrix is None:
-            # Default: Mild self-inhibition, no cross-talk
-            self.coupling_matrix = jnp.eye(3) * 0.5
-        else:
-            self.coupling_matrix = jnp.array(coupling_matrix)
+        self.config = config
 
     def __call__(self, D_macro: jax.Array) -> jax.Array:
         return self.apply(D_macro)
@@ -114,7 +88,7 @@ class ChemicalDevelopment(eqx.Module):
         # Map sigma_soft to decay rate for the recursive filter
         # Heuristic: Decay constant related to sigma. 
         # For a recursive filter e^(-x/sigma), decay factor alpha = e^(-1/sigma)
-        drag_decay = jnp.exp(-1.0 / self.sigma_soft)
+        drag_decay = jnp.exp(-1.0 / self.config.sigma_soft)
         # Ensure decay is valid (0 to 1) and stable
         drag_decay = jnp.clip(drag_decay, 0.0, 0.999) 
         
@@ -123,10 +97,12 @@ class ChemicalDevelopment(eqx.Module):
         
         # --- Hard Cloud (Local Softness/Tanning) ---
         w_hard = 25
-        cloud_hard = blur(D_macro, self.sigma_hard, self.drag_ratio, w_hard)
+        # Access sigma_hard from config
+        cloud_hard = blur(D_macro, self.config.sigma_hard, self.config.drag_ratio, w_hard)
         
         # 2. Compute Tanning Mask (Per Channel)
-        tanning_mask = (D_macro - self.d_min) / (self.d_max - self.d_min + 1e-6)
+        # Access d_min, d_max from config
+        tanning_mask = (D_macro - self.config.d_min) / (self.config.d_max - self.config.d_min + 1e-6)
         tanning_mask = jnp.clip(tanning_mask, 0.0, 1.0)
         
         # 3. Basis Interpolation
@@ -141,7 +117,8 @@ class ChemicalDevelopment(eqx.Module):
         # Transform the detail vectors using the matrix (allowing cross-talk).
         # We ADD this back to the macro density (Unsharp Masking technique).
         # Einsum: (3,3) @ (H,W,3) -> (H,W,3)
-        cross_channel_detail = jnp.einsum('ij, hwi -> hwj', self.coupling_matrix, high_pass_detail)
+        # Access coupling_matrix from config
+        cross_channel_detail = jnp.einsum('ij, hwi -> hwj', self.config.coupling_matrix, high_pass_detail)
         
         # Recombine: Base Density + Chemically Enhanced Edges
         D_micro_ideal = D_macro + cross_channel_detail
@@ -149,7 +126,7 @@ class ChemicalDevelopment(eqx.Module):
         # 6. Apply Exhaustion as a Density Cap (Supply Limiter)
         # Limit the maximum density based on available chemistry
         # We use d_max as the supply limit
-        supply_limit = self.d_max
+        supply_limit = self.config.d_max
         D_micro = supply_limit * jnp.tanh(D_micro_ideal / (supply_limit + 1e-6))
         
         return D_micro

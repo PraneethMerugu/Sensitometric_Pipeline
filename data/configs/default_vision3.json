@@ -1,0 +1,66 @@
+{
+    "name": "Kodak Vision3 250D (Default)",
+    "optical": {
+        "scatter_gamma": 0.65,
+        "bloom_weight": 0.15,
+        "halation_radius": 30.0,
+        "halation_sigma": 8.0,
+        "halation_gain": 1.5,
+        "yellow_filter_cutoff": 510.0,
+        "yellow_filter_slope": 0.15,
+        "halation_smoothness": 0.2
+    },
+    "chemical": {
+        "sigma_soft": 2.0,
+        "sigma_hard": 0.5,
+        "gamma": 2.0,
+        "d_min": 0.0,
+        "d_max": 3.0,
+        "drag_ratio": 1.0,
+        "exhaustion_alpha": 2.0,
+        "exhaustion_beta": 0.5
+    },
+    "sensitometry": {
+        "curve_params": [
+            [
+                0.2,
+                2.5,
+                1.0,
+                -1.5,
+                1.0
+            ],
+            [
+                0.2,
+                2.5,
+                1.0,
+                -1.5,
+                1.0
+            ],
+            [
+                0.2,
+                2.5,
+                1.0,
+                -1.5,
+                1.0
+            ]
+        ],
+        "red_curve_path": "../Kodak_Vision3_250d/Red_d_log_e.csv",
+        "green_curve_path": "../Kodak_Vision3_250d/Green_d_log_e.csv",
+        "blue_curve_path": "../Kodak_Vision3_250d/Blue_d_log_e.csv"
+    },
+    "paths": {
+        "lut_dir": "../luts",
+        "cyan_density": "../Kodak_Vision3_250d/cyan_density.csv",
+        "magenta_density": "../Kodak_Vision3_250d/magenta_density.csv",
+        "yellow_density": "../Kodak_Vision3_250d/yellow_density.csv",
+        "min_density": "../Kodak_Vision3_250d/minimum_density.csv",
+        "status_m_red": "../StatusM/StatusM_Red.csv",
+        "status_m_green": "../StatusM/StatusM_Green.csv",
+        "status_m_blue": "../StatusM/StatusM_Blue.csv"
+    },
+    "grain": {
+        "enabled": false,
+        "model_path": "../grainnet/grainnet_flax.pkl",
+        "grain_radius": 0.5
+    }
+}

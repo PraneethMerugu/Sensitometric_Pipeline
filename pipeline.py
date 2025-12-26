@@ -15,69 +15,107 @@ Flow:
 import jax
 import jax.numpy as jnp
 import equinox as eqx
-from typing import Dict, Any
+from typing import Dict, Any, Union, Optional
+from pathlib import Path
 
 from core.optical import OpticalPhysics
 from core.chemical import ChemicalDevelopment
 from core.sensitometry import SensitometricCurve
-from core.color import ColorimetricTransform
-from core.grainnet import GrainNet
-from core.grainnet import GrainNet
+from core.color.spectral_mixer import SpectralDyeMixer
+from core.color.scanner import VirtualScanner
+from core.grainnet import GrainNet, load_grainnet
 from core.upsampler.spectral_upsampler import create_upsampler, SpectralUpsampler
+from core.config import FilmConfig, load_config, SensitometryConfig, ChemicalConfig, GrainConfig
 
 class FilmPipeline(eqx.Module):
     optical: OpticalPhysics
     upsampler: SpectralUpsampler
     chemistry: ChemicalDevelopment
     tone_curve: SensitometricCurve
-    color_transform: ColorimetricTransform
+    dye_mixer: SpectralDyeMixer
+    scanner: VirtualScanner
     grain_net: GrainNet
     
+    # --- Parameters ---
+    config: FilmConfig
+
     def __init__(
         self,
-        params: Dict[str, Any],
-        grain_model_params: Dict,
-        color_transform: ColorimetricTransform
+        config: FilmConfig
     ):
+        self.config = config
+        
         # 1. Shared Resources
-        self.upsampler = create_upsampler(lut_size=32, data_dir="data/luts")
+        self.upsampler = create_upsampler(lut_size=32, data_dir=config.paths.lut_dir)
 
         # 2. Optical
+        # Pass the optical config directly
         self.optical = OpticalPhysics(
-            upsampler=self.upsampler,
-            scatter_gamma=params.get('scatter_gamma', 0.65),
-            bloom_mix=params.get('bloom_weight', 0.15),
-            halation_radius=params.get('halation_radius', 30.0),
-            halation_sigma=params.get('halation_sigma', 8.0),
-            halation_gain=params.get('halation_gain', 1.5)
+            config=config.optical,
+            upsampler=self.upsampler
         )
         
         # 2. Physics / Sensitometry
-        # We assume curve_params is passed in params
-        self.tone_curve = SensitometricCurve(params=params['curve_params'])
+        # Ideally config.sensitometry.curve_params should be populated by the builder if not present.
+        if config.sensitometry.curve_params is not None:
+             self.tone_curve = SensitometricCurve(params=jnp.array(config.sensitometry.curve_params))
+        else:
+             if config.sensitometry.red_curve_path:
+                 print("Fitting Sensitometric Curves from Config Paths...")
+                 self.tone_curve = SensitometricCurve.fit_from_csvs(
+                     config.sensitometry.red_curve_path,
+                     config.sensitometry.green_curve_path,
+                     config.sensitometry.blue_curve_path
+                 )
+             else:
+                 raise ValueError("FilmConfig must have either `curve_params` or valid curve paths.")
         
-        # Resolve Matrix
-        c_mat = params.get('coupling_matrix', None)
-        if c_mat is None:
-            # Fallback to legacy gamma (Self-Inhibition Only)
-            # FIX: "Double-Counting Crosstalk"
-            # We use a Diagonal Matrix to prevent adding color crosstalk (already in curves).
-            g = params.get('gamma', 2.0)
-            c_mat = jnp.eye(3) * g
-            
+        # 3. Chemical
+        # Pass the chemical config directly
         self.chemistry = ChemicalDevelopment(
-            sigma_soft=params.get('sigma_soft', 2.0),
-            sigma_hard=params.get('sigma_hard', 0.5),
-            coupling_matrix=c_mat,
-            d_min=params.get('d_min', 0.0),
-            d_max=params.get('d_max', 3.0)
+            config=config.chemical
         )
         
-        # 3. Color
-        self.color_transform = color_transform
+        # 4. Color (Spectral)
+        self.dye_mixer = SpectralDyeMixer.from_csvs(
+            config.paths.cyan_density,
+            config.paths.magenta_density,
+            config.paths.yellow_density,
+            config.paths.min_density
+        )
+        
+        self.scanner = VirtualScanner.from_status_m(
+            config.paths.status_m_blue,
+            config.paths.status_m_green,
+            config.paths.status_m_red
+        )
         
         # 4. Grain
-        self.grain_net = GrainNet(params=grain_model_params)
+        if config.grain.enabled:
+            # Try to load if path exists
+            p = Path(config.grain.model_path)
+            if p.exists():
+                self.grain_net = load_grainnet(p)
+            else:
+                 # Fallback for now or raise warning
+                 print(f"Warning: Grain model not found at {p}. Using uninitialized dummy.")
+                 from core.grainnet.core import GrainNetFlax
+                 flax_model = GrainNetFlax()
+                 dummy_init_key = jax.random.PRNGKey(0)
+                 dummy_params = flax_model.init(dummy_init_key, jnp.zeros((1, 32, 32, 1)), jnp.array([[0.5]]), dummy_init_key)['params']
+                 self.grain_net = GrainNet(params=dummy_params)
+        else:
+             # Create a pass-through or dummy? 
+             # For now, just load a dummy to keep type safety, but we might want a flag to skip in __call__
+             # Or we can just set grain radius to 0 effectively or handling it in __call__
+             pass
+             # We will assume it exists for now to satisfy Equinox structure, 
+             # but maybe we should make it Optional in the class definition.
+             # For now, let's just make it a dummy if disabled.
+             from core.grainnet.core import GrainNetFlax
+             flax_model = GrainNetFlax()
+             dummy_params = flax_model.init(jax.random.PRNGKey(0), jnp.zeros((1, 32, 32, 1)), jnp.array([[0.5]]), jax.random.PRNGKey(0))['params']
+             self.grain_net = GrainNet(params=dummy_params)
 
     def __call__(self, actinic_exposure: jax.Array, key: jax.random.PRNGKey) -> jax.Array:
         """
@@ -91,53 +129,37 @@ class FilmPipeline(eqx.Module):
             (H, W, 3) Final Image (with grain).
         """
         # 1. OPTICAL TRANSPORT (Linear)
-        # Simulates light spreading in the emulsion *before* development
-        # Output: Latent Image Distribution (E)
         latent_image = self.optical(actinic_exposure)
         
         # 2. CHEMICAL DEVELOPMENT (Non-Linear)
-        # Simulates the development tank. 
-        # Applies Tone Mapping AND Edge Effects (Matrix Model).
-        # Output: Analytical Dye Densities (C, M, Y) 
-        
-        # First: Apply Macro Tone Mapping
         d_macro = self.tone_curve(latent_image)
-        
-        # Second: Apply Micro-Contrast (Adjacency)
         developed_density = self.chemistry(d_macro)
         
-        # 3. COLORIMETRY
-        # Convert dye densities (CMY) to Visual Integral Densities (RGB)
-        # "The Virtual Inverse"
-        # Input: Developed Density (CMY) -> Output: Integral Density (RGB Negative)
-        # We need to ensure the order is correct. Our chemistry solves for R, G, B 'layers'.
-        # R layer -> Cyan Dye
-        # G layer -> Magenta Dye
-        # B layer -> Yellow Dye
-        # So developed_density (R,G,B order) IS (C,M,Y order) for the color module.
-        virtual_negative = self.color_transform(developed_density)
+        # 3. SPECTRAL SYNTHESIS
+        film_strip_spectral = self.dye_mixer(developed_density)
         
-        # Positive Print (Optional but usually desired for viewing)
-        # Since GrainNet expects image-like stats, do we feed it the Density or the Transmittance?
-        # Standard: Grain is applied to DENSITY.
+        # 4. VIRTUAL SCANNING
+        scan_rgb = self.scanner(film_strip_spectral)
         
-        # 4. GRAIN SYNTHESIS
-        # Apply grain to the uniform density image.
-        # GrainNet (in this codebase) usually expects [0,1] image-like range?
-        # Let's check GrainNet signature: it takes `image` and `grain_radius`.
-        # Taking "Virtual Negative" as the base.
-        # NOTE: GrainNet's `grain_radius` is a scalar strength.
-        final_with_grain = self.grain_net(virtual_negative, grain_radius=0.5, key=key)
+        # 5. GRAIN SYNTHESIS
+        final_with_grain = self.grain_net(scan_rgb, grain_radius=0.5, key=key)
         
-        # 5. INVERSION (To Positive)
-        # D -> T = 10^-D
-        # This gives us the linear view of the negative.
-        # Usually we want a positive print.
-        # For this pipeline stage, let's return the "Scan" of the negative.
-        # i.e. Transmittance. 
-        final_scan = jnp.power(10.0, -final_with_grain)
-        
-        return final_scan
+        return final_with_grain
+
+def build_pipeline(config_path: str) -> FilmPipeline:
+    """
+    Factory function to build a pipeline from a JSON config file.
+    """
+    config = load_config(config_path)
+    return FilmPipeline(config)
+
+def run_one_off(config_path: str, image: jnp.ndarray) -> jnp.ndarray:
+    """
+    Run a single image through the pipeline defined by the config.
+    """
+    pipeline = build_pipeline(config_path)
+    key = jax.random.PRNGKey(0) # Deterministic for one-off
+    return pipeline(image, key)
 
 # ==============================================================================
 # PIPELINE VERIFICATION
@@ -145,49 +167,44 @@ class FilmPipeline(eqx.Module):
 if __name__ == "__main__":
     print("--- Pipeline Integration Test ---")
     
-    # 1. Dummy Data / Params
+    # 1. Dummy Data
     h, w = 64, 64
     dummy_input = jnp.zeros((h, w, 3))
     dummy_input = dummy_input.at[h//4:3*h//4, w//4:3*w//4, :].set(0.5)
     
     key = jax.random.PRNGKey(42)
     
-    # Sensitometry Params
-    curve_p = jnp.array([[-0.2, 2.0, 0.6, -1.0, 1.0]] * 3) # Simple Sigmoid
+    # 2. Create Config Programmatically
+    # Equinox modules are immutable, so we must instantiate with desired values.
     
-    pipeline_params = {
-        'curve_params': curve_p,
-        'scatter_gamma': 0.5,
-        'gamma': 3.0 # High chemical adjacency
-    }
+    # Sensitometry with custom params
+    sensitometry = SensitometryConfig(
+        curve_params=[[-0.2, 2.0, 0.6, -1.0, 1.0]] * 3
+    )
     
-    # Mock GrainNet Params (Empty)
-    # GrainNetFlax needs valid params structure even if dummy
-    # We'll just mock the class call if needed, but better to instantiate if compatible.
-    # Since we can't easily load a pkl here, we might fail unless we mock GrainNet.
-    # Let's trust the imports.
+    # Chemical with custom params
+    chemical = ChemicalConfig(
+        gamma=3.0,
+        d_max=3.0,
+        drag_ratio=1.0, 
+        exhaustion_alpha=2.0
+    )
+    
+    # Grain (disabled)
+    grain = GrainConfig(enabled=False)
+    
+    config = FilmConfig(
+        name="Test Configuration",
+        sensitometry=sensitometry,
+        chemical=chemical,
+        grain=grain
+    )
+
+    # Mock GrainNet Params if needed (logic handled in __init__ fallback now if enabled, but we disabled it)
     
     try:
-        # Mock Color Transform
-        # Identity matrix for testing
-        color_params = jnp.eye(3)
-        base_dens = jnp.zeros((3,))
-        color_sys = ColorimetricTransform(color_params, base_dens, jnp.array([650., 550., 450.]))
-        
-        # Mock GrainNet for this test 
-        # (avoiding loading large pkl or random init of flax model which might be complex)
-        # We'll update the class to allow empty init or similar? 
-        # Actually, let's just initialize GrainNet with dummy params.
-        from core.grainnet.core import GrainNetFlax
-        flax_model = GrainNetFlax()
-        dummy_init_key = jax.random.PRNGKey(0)
-        dummy_params = flax_model.init(dummy_init_key, jnp.zeros((1, 32, 32, 1)), jnp.array([[0.5]]), dummy_init_key)['params']
-        
-        pipeline = FilmPipeline(
-            params=pipeline_params,
-            grain_model_params=dummy_params,
-            color_transform=color_sys
-        )
+        print("Initializing Pipeline with Config...")
+        pipeline = FilmPipeline(config=config)
         
         print("Running Pipeline...")
         out_img = pipeline(dummy_input, key)

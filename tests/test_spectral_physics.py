@@ -17,6 +17,7 @@ sys.path.append(os.getcwd())
 
 from core.optical.scattering import OpticalPhysics
 from core.upsampler.spectral_upsampler import create_upsampler
+from core.config import OpticalConfig
 
 def test_blue_light_physics():
     print("--- Spectral Halation Verification (The Blue Light Test) ---")
@@ -32,13 +33,19 @@ def test_blue_light_physics():
 
     # 2. Configure Physics
     # High halation gain to make it obvious
-    optical = OpticalPhysics(
-        upsampler=upsampler,
+    # 2. Configure Physics
+    # High halation gain to make it obvious
+    config = OpticalConfig(
         scatter_gamma=0.5,
-        bloom_mix=0.0,        # Disable Bloom to isolate Halation
+        bloom_weight=0.0,     # Disable Bloom to isolate Halation
         halation_radius=10.0, # Small radius
         halation_sigma=2.0,
         halation_gain=10.0    # Exaggerate effect
+    )
+    
+    optical = OpticalPhysics(
+        config=config,
+        upsampler=upsampler
     )
 
     # 3. Create Test Image (128x128)
